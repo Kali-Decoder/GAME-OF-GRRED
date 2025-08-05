@@ -1,142 +1,152 @@
-import { expect } from "chai";
-import hre from "hardhat";
-import { time } from "@nomicfoundation/hardhat-toolbox/network-helpers";
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.28;
 
-describe("GameOfGreed", function () {
-  async function deployFixture() {
-    const [owner, player1, player2, outsider] = await hre.ethers.getSigners();
-    const ERC20Mock = await hre.ethers.getContractFactory("ERC20Mock");
-    const token = await ERC20Mock.deploy("Mock USDC", "mUSDC", owner.address, 0);
-    const initialBalance = hre.ethers.parseUnits("1000", 18);
-    await token.mint(player1.address, initialBalance);
-    await token.mint(player2.address, initialBalance);
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+contract GameOfGreed {
+    enum Decision { NONE, STEAL, SPLIT }
 
-    const GameOfGreed = await hre.ethers.getContractFactory("GameOfGreed");
-    const game = await GameOfGreed.deploy(await token.getAddress());
-
-    return { token, game, owner, player1, player2, outsider, initialBalance };
-  }
-
-  describe("Room creation & joining", function () {
-    it("should create a room with correct stake", async function () {
-      const { game, token, player1 } = await deployFixture();
-      const stake = hre.ethers.parseUnits("10", 18);
-
-      await token.connect(player1).approve(game.target, stake);
-      await expect(game.connect(player1).createRoom(stake))
-        .to.emit(game, "RoomCreated")
-        .withArgs(1, player1.address, stake);
-
-      const room = await game.rooms(1);
-      expect(room.player1).to.equal(player1.address);
-      expect(room.stakeAmount).to.equal(stake);
-    });
-
-    it("should allow another player to join", async function () {
-      const { game, token, player1, player2 } = await deployFixture();
-      const stake = hre.ethers.parseUnits("10", 18);
-
- 
-      await token.connect(player1).approve(game.target, stake);
-      await game.connect(player1).createRoom(stake);
-
-     
-      await token.connect(player2).approve(game.target, stake);
-      await expect(game.connect(player2).joinRoom(1))
-        .to.emit(game, "PlayerJoined")
-        .withArgs(1, player2.address);
-
-      const room = await game.rooms(1);
-      expect(room.player2).to.equal(player2.address);
-    });
-
-    it("should not allow player to join their own room", async function () {
-      const { game, token, player1 } = await deployFixture();
-      const stake = hre.ethers.parseUnits("10", 18);
-
-      await token.connect(player1).approve(game.target, stake);
-      await game.connect(player1).createRoom(stake);
-
-      await expect(game.connect(player1).joinRoom(1)).to.be.revertedWith("Can't join own room");
-    });
-  });
-
-  describe("Game decisions & payouts", function () {
-    async function setupRoomAndJoin() {
-      const { game, token, player1, player2 } = await deployFixture();
-      const stake = hre.ethers.parseUnits("10", 18);
-
-
-      await token.connect(player1).approve(game.target, stake);
-      await game.connect(player1).createRoom(stake);
-
-   
-      await token.connect(player2).approve(game.target, stake);
-      await game.connect(player2).joinRoom(1);
-
-      return { game, token, player1, player2, stake };
+    struct Room {
+        address player1;
+        address player2;
+        uint256 stakeAmount; 
+        Decision decision1;
+        Decision decision2;
+        bool isFinished;
+        uint256 startTime; 
     }
 
-    it("should split funds if both choose SPLIT", async function () {
-      const { game, token, player1, player2, stake } = await setupRoomAndJoin();
+    IERC20 public immutable token; 
+    address public owner;
+    uint256 public roomCounter;
+    mapping(uint256 => Room) public rooms;
 
-      await game.connect(player1).makeDecision(1, 2); // SPLIT
-      await game.connect(player2).makeDecision(1, 2); // SPLIT
+    uint256 public constant DECISION_TIME_LIMIT = 10 minutes;
 
-      const bal1 = await token.balanceOf(player1.address);
-      const bal2 = await token.balanceOf(player2.address);
+    event RoomCreated(uint256 indexed roomId, address indexed creator, uint256 stakeAmount);
+    event PlayerJoined(uint256 indexed roomId, address indexed player);
+    event DecisionMade(uint256 indexed roomId, address indexed player, Decision decision);
+    event GameResolved(uint256 indexed roomId, string outcome);
 
-      expect(bal1).to.equal(hre.ethers.parseUnits("1000", 18));
-      expect(bal2).to.equal(hre.ethers.parseUnits("1000", 18));
-    });
+    constructor(address _tokenAddress) {
+        require(_tokenAddress != address(0), "Invalid token address");
+        token = IERC20(_tokenAddress);
+        owner = msg.sender;
+    }
 
-    it("should give all funds to STEAL player if other chooses SPLIT", async function () {
-      const { game, token, player1, player2, stake } = await setupRoomAndJoin();
+    modifier onlyPlayer(uint256 _roomId) {
+        require(
+            msg.sender == rooms[_roomId].player1 || msg.sender == rooms[_roomId].player2,
+            "Not a player in this room"
+        );
+        _;
+    }
 
-      await game.connect(player1).makeDecision(1, 1); // STEAL
-      await game.connect(player2).makeDecision(1, 2); // SPLIT
+    function createRoom(uint256 _stakeAmount) external returns (uint256) {
+        require(_stakeAmount > 0, "Stake must be > 0");
+        require(
+            token.transferFrom(msg.sender, address(this), _stakeAmount),
+            "Token transfer failed"
+        );
 
-      const bal1 = await token.balanceOf(player1.address);
-      const bal2 = await token.balanceOf(player2.address);
+        roomCounter++;
+        rooms[roomCounter] = Room({
+            player1: msg.sender,
+            player2: address(0),
+            stakeAmount: _stakeAmount,
+            decision1: Decision.NONE,
+            decision2: Decision.NONE,
+            isFinished: false,
+            startTime: 0
+        });
 
-      expect(bal1).to.equal(hre.ethers.parseUnits("1020", 18));
-      expect(bal2).to.equal(hre.ethers.parseUnits("980", 18));
-    });
+        emit RoomCreated(roomCounter, msg.sender, _stakeAmount);
+        return roomCounter;
+    }
 
-    it("should keep funds in contract if both choose STEAL", async function () {
-      const { game, token, player1, player2, stake } = await setupRoomAndJoin();
+    function joinRoom(uint256 _roomId) external {
+        Room storage room = rooms[_roomId];
+        require(room.player2 == address(0), "Room full");
+        require(msg.sender != room.player1, "Can't join own room");
 
-      await game.connect(player1).makeDecision(1, 1); // STEAL
-      await game.connect(player2).makeDecision(1, 1); // STEAL
+        // Must match stake amount exactly
+        require(
+            token.transferFrom(msg.sender, address(this), room.stakeAmount),
+            "Token transfer failed"
+        );
 
-      const gameBalance = await token.balanceOf(game.target);
-      expect(gameBalance).to.equal(stake.mul(2));
-    });
-  });
+        room.player2 = msg.sender;
+        room.startTime = block.timestamp; // Start 10-min timer
+        emit PlayerJoined(_roomId, msg.sender);
+    }
 
-  describe("Time expiration", function () {
-    it("should lock funds if time expires before both decide", async function () {
-      const { game, token, player1, player2 } = await deployFixture();
-      const stake = hre.ethers.parseUnits("10", 18);
+    function makeDecision(uint256 _roomId, Decision _decision) external onlyPlayer(_roomId) {
+        Room storage room = rooms[_roomId];
+        require(!room.isFinished, "Game finished");
+        require(room.startTime > 0, "Game hasn't started");
+        require(block.timestamp <= room.startTime + DECISION_TIME_LIMIT, "Decision time expired");
+        require(_decision == Decision.STEAL || _decision == Decision.SPLIT, "Invalid decision");
 
+        if (msg.sender == room.player1) {
+            require(room.decision1 == Decision.NONE, "Already decided");
+            room.decision1 = _decision;
+        } else {
+            require(room.decision2 == Decision.NONE, "Already decided");
+            room.decision2 = _decision;
+        }
 
-      await token.connect(player1).approve(game.target, stake);
-      await game.connect(player1).createRoom(stake);
-      await token.connect(player2).approve(game.target, stake);
-      await game.connect(player2).joinRoom(1);
+        emit DecisionMade(_roomId, msg.sender, _decision);
 
-    
-      await game.connect(player1).makeDecision(1, 1); // STEAL
+        if (room.decision1 != Decision.NONE && room.decision2 != Decision.NONE) {
+            _resolveGame(_roomId);
+        }
+    }
 
+    function forceResolve(uint256 _roomId) external {
+        Room storage room = rooms[_roomId];
+        require(!room.isFinished, "Game finished");
+        require(room.startTime > 0, "Game hasn't started");
+        require(block.timestamp > room.startTime + DECISION_TIME_LIMIT, "Too early");
 
-      await time.increase(601);
+        // If one or both didn't decide → lock funds in contract
+        if (room.decision1 == Decision.NONE || room.decision2 == Decision.NONE) {
+            room.isFinished = true;
+            emit GameResolved(_roomId, "Time expired: Funds locked in contract");
+            return;
+        }
 
-      await expect(game.forceResolve(1))
-        .to.emit(game, "GameResolved")
-        .withArgs(1, "Time expired: Funds locked in contract");
+        _resolveGame(_roomId);
+    }
 
-      expect(await token.balanceOf(game.target)).to.equal(stake.mul(2));
-    });
-  });
-});
+    function _resolveGame(uint256 _roomId) internal {
+        Room storage room = rooms[_roomId];
+        uint256 totalAmount = room.stakeAmount * 2;
+        room.isFinished = true;
+
+        // Split / Split
+        if (room.decision1 == Decision.SPLIT && room.decision2 == Decision.SPLIT) {
+            token.transfer(room.player1, room.stakeAmount);
+            token.transfer(room.player2, room.stakeAmount);
+            emit GameResolved(_roomId, "Split / Split: Equal split");
+        }
+        // Steal / Split
+        else if (room.decision1 == Decision.STEAL && room.decision2 == Decision.SPLIT) {
+            token.transfer(room.player1, totalAmount);
+            emit GameResolved(_roomId, "Steal / Split: Player1 takes all");
+        }
+        // Split / Steal
+        else if (room.decision1 == Decision.SPLIT && room.decision2 == Decision.STEAL) {
+            token.transfer(room.player2, totalAmount);
+            emit GameResolved(_roomId, "Split / Steal: Player2 takes all");
+        }
+        // Steal / Steal → locked in contract
+        else if (room.decision1 == Decision.STEAL && room.decision2 == Decision.STEAL) {
+            emit GameResolved(_roomId, "Steal / Steal: Funds locked in contract");
+        }
+    }
+
+    function withdrawContractFunds() external {
+        require(msg.sender == owner, "Only owner can withdraw");
+        token.transfer(owner, token.balanceOf(address(this)));
+    }
+}
